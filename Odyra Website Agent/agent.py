@@ -204,6 +204,22 @@ def _sentry_span(op: str, name: str, start_ts: Optional[float] = None, end_ts: O
     if not (_SENTRY_ON and tx is not None):
         return
     try:
+        # Relay scarta l'intera transaction se uno span finisce prima di iniziare: con durata
+        # zero/assente lo span parte e finisce nello stesso istante, mai prima dell'inizio chiamata.
+        if end_ts is None:
+            end_ts = time.time()
+        if start_ts is None or start_ts > end_ts:
+            start_ts = end_ts
+        tx_start = getattr(tx, "start_timestamp", None)
+        if tx_start is not None:
+            try:
+                tx_start_f = tx_start.timestamp() if hasattr(tx_start, "timestamp") else float(tx_start)
+                if start_ts < tx_start_f:
+                    start_ts = tx_start_f
+                if end_ts < start_ts:
+                    end_ts = start_ts
+            except Exception:
+                pass
         sp = tx.start_child(op=op, name=name, start_timestamp=start_ts)
         for k, v in (data or {}).items():
             sp.set_data(k, v)
