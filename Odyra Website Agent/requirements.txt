@@ -13,3 +13,5 @@ livekit-plugins-silero==1.6.1
 livekit-plugins-tavus==1.6.1
 aiohttp
 python-dotenv
+# Osservabilita': errori e latenze su Sentry (opzionale, no-op senza SENTRY_DSN)
+sentry-sdk==2.73.0

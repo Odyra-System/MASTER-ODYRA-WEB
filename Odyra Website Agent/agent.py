@@ -33,7 +33,9 @@ import json
 import logging
 import os
 import re
+import time
 from datetime import datetime
+from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
 import aiohttp
@@ -60,6 +62,257 @@ from livekit.plugins import deepgram, inworld, openai, silero
 load_dotenv()
 logger = logging.getLogger("odyra_web")
 logging.basicConfig(level=logging.INFO)
+
+# ---------------------------------------------------------------------------
+# Sentry — errori di codice + latenze (LLM/STT/TTS/EOU, tool n8n, RAG) per chiamata.
+# Opzionale: senza SENTRY_DSN il worker parte e lavora esattamente come prima.
+# Regole: send_default_pii=False, niente variabili locali, breadcrumb solo da WARNING
+# in su (le righe INFO contengono le trascrizioni), scrubbing di numeri di telefono e
+# chiavi sensibili su ogni evento prima dell'invio. Nessun testo di conversazione esce.
+# ---------------------------------------------------------------------------
+try:
+    import sentry_sdk
+    from sentry_sdk import metrics as _sentry_metrics
+    from sentry_sdk.integrations.logging import LoggingIntegration as _SentryLoggingIntegration
+    _SENTRY_IMPORT_OK = True
+except Exception:  # pragma: no cover - sentry-sdk assente: tutto resta no-op
+    sentry_sdk = None
+    _sentry_metrics = None
+    _SENTRY_IMPORT_OK = False
+
+SENTRY_DSN = os.getenv("SENTRY_DSN", "").strip()
+SENTRY_ENVIRONMENT = (os.getenv("SENTRY_ENVIRONMENT") or os.getenv("RAILWAY_ENVIRONMENT_NAME") or "production").strip()
+SENTRY_RELEASE = (os.getenv("SENTRY_RELEASE") or os.getenv("RAILWAY_GIT_COMMIT_SHA") or "").strip() or None
+SENTRY_TRACES_SAMPLE_RATE = float(os.getenv("SENTRY_TRACES_SAMPLE_RATE", "1.0"))
+SENTRY_SERVICE_NAME = os.getenv("SENTRY_SERVICE_NAME", "odyra-website-agent").strip()
+
+# Numeri di telefono: almeno 9 cifre, separatori spazio/-/./() ammessi, prefisso +/00 opzionale.
+_SENTRY_PHONE_RE = re.compile(r"(?<![\d@])(?:\+|00)?(?:\d[ \-./()]*){8,14}\d(?!\d)")
+_SENTRY_PII_KEYS = frozenset({
+    "transcript", "text", "content", "user_text", "message_text", "first_message", "instructions",
+    "phone", "phone_number", "customer_phone", "sip_from", "caller_number", "customer_name",
+    "name", "full_name", "email", "note", "notes", "answer", "query",
+})
+_SENTRY_SKIP_KEYS = frozenset({"event_id", "timestamp", "start_timestamp", "sdk", "release",
+                               "environment", "tags", "trace_id", "span_id", "parent_span_id"})
+_SENTRY_CALL_TX = None  # transaction Sentry della chiamata in corso (un job per processo)
+
+
+def _sentry_scrub_value(value: Any, depth: int = 0) -> Any:
+    if depth > 12:
+        return value
+    if isinstance(value, str):
+        return _SENTRY_PHONE_RE.sub("[tel]", value) if len(value) >= 9 else value
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            if k in _SENTRY_SKIP_KEYS:
+                out[k] = v
+            elif isinstance(k, str) and k.lower() in _SENTRY_PII_KEYS:
+                out[k] = "[redatto]"
+            else:
+                out[k] = _sentry_scrub_value(v, depth + 1)
+        return out
+    if isinstance(value, (list, tuple)):
+        return [_sentry_scrub_value(v, depth + 1) for v in value]
+    return value
+
+
+
+def _sentry_scrub_strict(event: dict, hint: Any = None) -> Optional[dict]:
+    try:
+        return _sentry_scrub_value(event)
+    except Exception:
+        return None
+
+
+def _sentry_init() -> bool:
+    """Idempotente: chiamata all'import e all'inizio di ogni job (il processo del job potrebbe non ereditare il client)."""
+    if not (_SENTRY_IMPORT_OK and SENTRY_DSN):
+        return False
+    try:
+        if sentry_sdk.get_client().is_active():
+            return True
+        sentry_sdk.init(
+            dsn=SENTRY_DSN,
+            environment=SENTRY_ENVIRONMENT,
+            release=SENTRY_RELEASE,
+            traces_sample_rate=SENTRY_TRACES_SAMPLE_RATE,
+            send_default_pii=False,
+            include_local_variables=False,
+            attach_stacktrace=False,
+            max_breadcrumbs=50,
+            shutdown_timeout=2,
+            server_name=os.getenv("RAILWAY_SERVICE_NAME") or None,
+            before_send=_sentry_scrub_strict,
+            before_send_transaction=_sentry_scrub_strict,
+            auto_enabling_integrations=False,
+            integrations=[_SentryLoggingIntegration(level=logging.WARNING, event_level=logging.ERROR)],
+        )
+        gs = sentry_sdk.get_global_scope()
+        gs.set_tag("service", SENTRY_SERVICE_NAME)
+        gs.set_tag("agent_name", os.getenv("LIVEKIT_AGENT_NAME", "odyra_web"))
+        logger.info("[SENTRY] attivo env=%s release=%s traces=%.2f", SENTRY_ENVIRONMENT, SENTRY_RELEASE, SENTRY_TRACES_SAMPLE_RATE)
+        return True
+    except Exception as e:
+        logger.warning("[SENTRY] init fallita, continuo senza: %s", e)
+        return False
+
+
+_SENTRY_ON = _sentry_init()
+
+
+def _sentry_tag(key: str, value: Any) -> None:
+    if not _SENTRY_ON:
+        return
+    try:
+        sentry_sdk.get_global_scope().set_tag(key, str(value)[:200])
+        if _SENTRY_CALL_TX is not None:
+            _SENTRY_CALL_TX.set_tag(key, str(value)[:200])
+    except Exception:
+        pass
+
+
+def _sentry_capture(exc: BaseException, **tags: Any) -> None:
+    if not _SENTRY_ON:
+        return
+    try:
+        with sentry_sdk.new_scope() as sc:
+            for k, v in tags.items():
+                sc.set_tag(k, str(v)[:200])
+            sentry_sdk.capture_exception(exc)
+    except Exception:
+        pass
+
+
+def _sentry_message(msg: str, level: str = "error", **tags: Any) -> None:
+    if not _SENTRY_ON:
+        return
+    try:
+        with sentry_sdk.new_scope() as sc:
+            for k, v in tags.items():
+                sc.set_tag(k, str(v)[:200])
+            sentry_sdk.capture_message(msg, level=level)
+    except Exception:
+        pass
+
+
+def _sentry_span(op: str, name: str, start_ts: Optional[float] = None, end_ts: Optional[float] = None,
+                 data: Optional[dict] = None, status: str = "ok") -> None:
+    """Span figlio della transaction della chiamata, con timestamp espliciti (epoch s)."""
+    tx = _SENTRY_CALL_TX
+    if not (_SENTRY_ON and tx is not None):
+        return
+    try:
+        sp = tx.start_child(op=op, name=name, start_timestamp=start_ts)
+        for k, v in (data or {}).items():
+            sp.set_data(k, v)
+        sp.set_status(status)
+        sp.finish(end_timestamp=end_ts)
+    except Exception:
+        pass
+
+
+def _sentry_metric(name: str, value: float, unit: Optional[str] = None, **attributes: Any) -> None:
+    if not (_SENTRY_ON and _sentry_metrics is not None):
+        return
+    try:
+        attrs = {k: str(v)[:200] for k, v in attributes.items() if v not in (None, "")}
+        attrs.setdefault("service", SENTRY_SERVICE_NAME)
+        _sentry_metrics.distribution(name, float(value), unit=unit, attributes=attrs)
+    except Exception:
+        pass
+
+
+def _sentry_count(name: str, value: float = 1, **attributes: Any) -> None:
+    if not (_SENTRY_ON and _sentry_metrics is not None):
+        return
+    try:
+        attrs = {k: str(v)[:200] for k, v in attributes.items() if v not in (None, "")}
+        attrs.setdefault("service", SENTRY_SERVICE_NAME)
+        _sentry_metrics.count(name, float(value), attributes=attrs)
+    except Exception:
+        pass
+
+
+def _sentry_call_start(room: str) -> None:
+    global _SENTRY_CALL_TX
+    if not _SENTRY_ON:
+        return
+    try:
+        _sentry_init()
+        tx = sentry_sdk.start_transaction(name="voice_call", op="voice.call", source="task")
+        tx.set_tag("room", room)
+        _SENTRY_CALL_TX = tx
+        sentry_sdk.get_global_scope().set_tag("room", room)
+    except Exception:
+        _SENTRY_CALL_TX = None
+
+
+def _sentry_call_end(ended_reason: str, duration_s: float, tenant_id: str, had_handoff: bool) -> None:
+    global _SENTRY_CALL_TX
+    tx = _SENTRY_CALL_TX
+    if not (_SENTRY_ON and tx is not None):
+        return
+    try:
+        tx.set_tag("ended_reason", ended_reason)
+        tx.set_tag("had_handoff", str(bool(had_handoff)).lower())
+        tx.set_data("duration_s", round(duration_s, 2))
+        tx.finish()
+        _sentry_metric("web.call.duration", duration_s, unit="second", tenant_id=tenant_id, ended_reason=ended_reason)
+        _sentry_count("web.calls", 1, tenant_id=tenant_id, ended_reason=ended_reason, had_handoff=bool(had_handoff))
+        sentry_sdk.flush(timeout=2)
+    except Exception:
+        pass
+    finally:
+        _SENTRY_CALL_TX = None
+
+
+def _sentry_livekit_metrics(m: Any, tenant_id: str) -> None:
+    """Latenze LiveKit (LLM/STT/TTS/EOU) -> span + distribuzioni Sentry. Nessun testo."""
+    if not _SENTRY_ON:
+        return
+    try:
+        name = type(m).__name__
+        ts = float(getattr(m, "timestamp", 0) or 0) or time.time()
+        if name == "LLMMetrics":
+            dur = float(getattr(m, "duration", 0) or 0)
+            ttft = float(getattr(m, "ttft", 0) or 0)
+            model = getattr(m, "model_name", None) or getattr(m, "label", "llm")
+            _sentry_span("ai.llm", str(model), start_ts=ts - dur if dur else None, end_ts=ts,
+                         data={"ttft_s": ttft, "cancelled": bool(getattr(m, "cancelled", False)),
+                               "prompt_tokens": getattr(m, "prompt_tokens", 0),
+                               "completion_tokens": getattr(m, "completion_tokens", 0)})
+            if ttft > 0:
+                _sentry_metric("web.llm.ttft", ttft, unit="second", tenant_id=tenant_id, model=model)
+            if dur > 0:
+                _sentry_metric("web.llm.duration", dur, unit="second", tenant_id=tenant_id, model=model)
+        elif name == "TTSMetrics":
+            dur = float(getattr(m, "duration", 0) or 0)
+            ttfb = float(getattr(m, "ttfb", 0) or 0)
+            model = getattr(m, "model_name", None) or getattr(m, "label", "tts")
+            _sentry_span("ai.tts", str(model), start_ts=ts - dur if dur else None, end_ts=ts,
+                         data={"ttfb_s": ttfb, "cancelled": bool(getattr(m, "cancelled", False)),
+                               "characters": getattr(m, "characters_count", 0)})
+            if ttfb > 0:
+                _sentry_metric("web.tts.ttfb", ttfb, unit="second", tenant_id=tenant_id, model=model)
+        elif name == "STTMetrics":
+            dur = float(getattr(m, "duration", 0) or 0)
+            model = getattr(m, "model_name", None) or getattr(m, "label", "stt")
+            _sentry_span("ai.stt", str(model), start_ts=ts - dur if dur else None, end_ts=ts,
+                         data={"audio_duration_s": getattr(m, "audio_duration", 0)})
+            if dur > 0:
+                _sentry_metric("web.stt.duration", dur, unit="second", tenant_id=tenant_id, model=model)
+        elif name == "EOUMetrics":
+            eou = float(getattr(m, "end_of_utterance_delay", 0) or 0)
+            tdel = float(getattr(m, "transcription_delay", 0) or 0)
+            _sentry_span("ai.eou", "end_of_utterance", start_ts=ts - eou if eou else None, end_ts=ts,
+                         data={"transcription_delay_s": tdel})
+            if eou > 0:
+                _sentry_metric("web.eou.delay", eou, unit="second", tenant_id=tenant_id)
+    except Exception:
+        pass
+
 # Debug mirato del plugin voce: se lo streaming Inworld non emette audio, qui
 # compaiono i dettagli (handshake, errori, chiusure) del percorso live.
 # Spento di default in produzione; riattivabile con INWORLD_DEBUG=1.
@@ -400,14 +653,23 @@ def build_instructions() -> str:
 
 async def _post_json(url: str, payload: dict) -> str:
     """POST JSON, ritorna il testo della risposta (o errore leggibile dal modello)."""
+    _t0 = time.time()
+    _name = url.rstrip("/").rsplit("/", 1)[-1] or "post"
     try:
         async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as s:
             async with s.post(url, json=payload) as resp:
                 text = await resp.text()
                 logger.info("POST %s -> %s", url, resp.status)
+                _sentry_span("web.tool", _name, start_ts=_t0, end_ts=time.time(),
+                             data={"http_status": resp.status}, status="internal_error" if resp.status >= 500 else "ok")
+                _sentry_metric("web.tool.duration", time.time() - _t0, unit="second", tool=_name, http_status=resp.status)
+                if resp.status >= 500:
+                    _sentry_message(f"tool {_name}: HTTP {resp.status}", tool=_name, http_status=resp.status)
                 return text
     except Exception as e:  # noqa: BLE001
         logger.exception("POST %s failed", url)
+        _sentry_span("web.tool", _name, start_ts=_t0, end_ts=time.time(), data={"error": type(e).__name__}, status="internal_error")
+        _sentry_capture(e, tool=_name)
         return json.dumps({"error": str(e)})
 
 
@@ -779,6 +1041,9 @@ async def entrypoint(ctx: JobContext) -> None:
                 ctx.room.name, ctx.job.metadata, initial_lang)
 
     await ctx.connect()
+    _sentry_call_start(ctx.room.name)
+    _sentry_tag("tenant_id", TENANT_ID)
+    _sentry_tag("lang", initial_lang)
 
     loop = asyncio.get_running_loop()
     state = {
@@ -854,6 +1119,7 @@ async def entrypoint(ctx: JobContext) -> None:
     session.on("user_input_transcribed", _on_user_text)
     session.on("agent_state_changed", lambda ev: _touch())
     session.on("user_state_changed", lambda ev: _touch())
+    session.on("metrics_collected", lambda ev: _sentry_livekit_metrics(ev.metrics, TENANT_ID))
 
     def _on_disconnect(participant) -> None:
         # L'utente ha chiuso il widget / la pagina: fine sessione.
@@ -1034,6 +1300,12 @@ async def entrypoint(ctx: JobContext) -> None:
                 t.cancel()
 
     ctx.add_shutdown_callback(_cancel_watchdogs)
+
+    async def _sentry_close(reason: str = "") -> None:
+        _sentry_call_end(str(state.get("ended_reason") or reason or "completed"),
+                         max(0.0, loop.time() - float(state["start"])), TENANT_ID, False)
+
+    ctx.add_shutdown_callback(_sentry_close)
 
 
 if __name__ == "__main__":
