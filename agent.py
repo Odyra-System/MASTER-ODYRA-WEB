@@ -78,14 +78,14 @@ LLM_ATTEMPT_TIMEOUT_S = _envf("LLM_ATTEMPT_TIMEOUT_S", 3.0)
 
 # TTS: inworld (predefinito, come oggi) o cartesia. Riserva Cartesia spenta di default: con il
 # FallbackAdapter Inworld passava alla sintesi non in streaming e restava muto.
-TTS_PROVIDER = _env("TTS_PROVIDER", "inworld").lower()
+TTS_PROVIDER = _env("TTS_PROVIDER", "cartesia" if _env("CARTESIA_API_KEY") else "inworld").lower()
 TTS_FALLBACK_ENABLED = _envb("TTS_FALLBACK_ENABLED", False)
 INWORLD_MODEL = _env("INWORLD_MODEL", "inworld-tts-2")
 INWORLD_VOICE = _env("INWORLD_VOICE")
 INWORLD_SPEAKING_RATE = _envf("INWORLD_SPEAKING_RATE", 1.1)
 INWORLD_DELIVERY_MODE = _env("INWORLD_DELIVERY_MODE", "CREATIVE")
 CARTESIA_MODEL = _env("CARTESIA_MODEL", "sonic-3")
-CARTESIA_VOICE = _env("CARTESIA_VOICE")
+CARTESIA_VOICE = _env("CARTESIA_VOICE") or _env("CARTESIA_VOICE_ID")  # tutti e due i nomi vanno bene
 
 # STT: Deepgram.
 DEEPGRAM_MODEL = _env("DEEPGRAM_MODEL", "nova-3-general")
@@ -395,7 +395,11 @@ def prewarm(proc: JobProcess) -> None:
     proc.userdata["vad"] = _load_vad()
     if PROMPT_MISSING:
         logger.warning("prompt condiviso incompleto: mancano %s (cartella %s)", PROMPT_MISSING, AGENTE_DIR)
-    logger.info("pronto: agent=%s llm=%s tts=%s avatar=%s", AGENT_NAME, LLM_PROVIDER, TTS_PROVIDER, AVATAR_ENABLED)
+    voce = CARTESIA_VOICE if TTS_PROVIDER == "cartesia" else INWORLD_VOICE
+    logger.info("pronto: agent=%s llm=%s tts=%s voce=%s avatar=%s", AGENT_NAME, LLM_PROVIDER, TTS_PROVIDER,
+                (voce[:8] + "…") if voce else "PREDEFINITA DEL FORNITORE (manca l'ID della voce!)", AVATAR_ENABLED)
+    if TTS_PROVIDER == "cartesia" and not CARTESIA_VOICE:
+        logger.warning("CARTESIA_VOICE (o CARTESIA_VOICE_ID) non impostata: si sente la voce predefinita")
 
 
 def _is_agent(participant) -> bool:

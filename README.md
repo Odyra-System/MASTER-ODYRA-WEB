@@ -78,8 +78,8 @@ Facoltative (con il valore predefinito):
 | `OPENAI_MODEL` (o `LLM_MODEL`) | `gpt-4.1-mini` | |
 | `ANTHROPIC_MODEL` (o `LLM_FALLBACK_MODEL`) | `claude-sonnet-4-6` | |
 | `LLM_FALLBACK_ENABLED`, `LLM_ATTEMPT_TIMEOUT_S`, `LLM_TEMPERATURE` | `true`, `3.0`, `0.4` | |
-| `TTS_PROVIDER` | `inworld` | `inworld` o `cartesia` |
-| `CARTESIA_API_KEY`, `CARTESIA_VOICE`, `CARTESIA_MODEL` | –, –, `sonic-3` | per `TTS_PROVIDER=cartesia` o per la riserva |
+| `TTS_PROVIDER` | `cartesia` se c'è `CARTESIA_API_KEY`, altrimenti `inworld` | `inworld` o `cartesia` |
+| `CARTESIA_API_KEY`, `CARTESIA_VOICE` (o `CARTESIA_VOICE_ID`), `CARTESIA_MODEL` | –, –, `sonic-3` | per `TTS_PROVIDER=cartesia` o per la riserva |
 | `TTS_FALLBACK_ENABLED` | `false` | riserva della voce; spenta perché con la riserva la voce principale passava a una modalità che restava muta |
 | `INWORLD_MODEL`, `INWORLD_SPEAKING_RATE`, `INWORLD_DELIVERY_MODE` | `inworld-tts-2`, `1.1`, `CREATIVE` | |
 | `DEEPGRAM_MODEL`, `DEEPGRAM_LANGUAGE` | `nova-3-general`, automatico | automatico = `multi` per it/en/es/fr/de, monolingua per pl/ro |
