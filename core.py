@@ -71,7 +71,11 @@ def download_shared(url: Optional[str] = None, secret: Optional[str] = None, des
     for key, name in (("istruzioni", "istruzioni.md"), ("conoscenza", "conoscenza.md"), ("pagine", "pagine.json")):
         val = data.get(key)
         if isinstance(val, str) and val.strip():
-            (dest / name).write_text(val, encoding="utf-8")
+            # Scrittura atomica: più processi del worker scaricano insieme all'avvio e nessuno deve
+            # leggere un file a metà (prima si scrive un file temporaneo, poi si sostituisce in un colpo).
+            tmp = dest / f".{name}.{os.getpid()}.tmp"
+            tmp.write_text(val, encoding="utf-8")
+            os.replace(tmp, dest / name)
     return dest
 
 
